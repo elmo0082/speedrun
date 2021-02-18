@@ -8,6 +8,8 @@ _KEY_MAPPING = {
     'images': 'image',
     'figure': 'figure',
     'figures': 'figure',
+    'persistence_diagram': 'persistence_diagram',
+    'persistence_diagrams': 'persistence_diagram',
     'embedding': 'embedding',
     'embeddings': 'embedding',
     'text': 'text',
@@ -56,6 +58,8 @@ def log_image(*args, **kwargs):
 def log_figure(*args, **kwargs):
     _log_object('figure', *args, **kwargs)
 
+def log_persistence_diagram(*args, **kwargs):
+    _log_object('persistence_diagram', *args, **kwargs)
 
 def log_embedding(*args, **kwargs):
     _log_object('embedding', *args, **kwargs)

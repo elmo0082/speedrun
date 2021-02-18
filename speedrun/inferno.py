@@ -6,9 +6,12 @@ from .py_utils import locate, get_single_key_value_pair, create_instance
 from .log_anywhere import register_logger, log_scalar
 from .tensorboard import TensorboardMixin
 from inferno.io.transform import Compose
+from copy import deepcopy
 
 try:
     import inferno
+    from inferno.utils import python_utils as pyu
+    from inferno.io.core.base import IndexSpec
 except ImportError:
     inferno = None
 try:
@@ -335,3 +338,406 @@ class InfernoMixin(ParsingMixin):
 
     def train(self):
         return self.trainer.fit()
+
+import numpy as np
+
+
+class SimpleInferenceMixin(InfernoMixin):
+    def infer_simple(self):
+
+
+        self.trainer.eval_mode()
+        loader_name= "validate"
+
+        # Everytime we should loop over the full dataset (restart generators):
+        # TODO: this will probably load a random batch. You maybe want to turn random=False
+        loader_iter = self.val_loader.__iter__()
+
+        from inferno.utils import python_utils as pyu
+
+        # Record the epoch we're validating in
+        iteration_num = 0
+        nb_tot_predictions = len(loader_iter)
+        while True:
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                self.trainer.console.info("Generator exhausted, breaking.")
+                break
+
+            # Delay SIGINTs till after computation
+            with pyu.delayed_keyboard_interrupt(), torch.no_grad():
+                batch = self.trainer.wrap_batch(batch, from_loader=loader_name, volatile=True)
+                # Separate
+                inputs, target = self.trainer.split_batch(batch, from_loader=loader_name)
+
+                # # Wrap
+                # inputs = self.trainer.to_device(inputs)
+                outputs = self.trainer.apply_model(*inputs)
+
+                self.trainer.console.progress(
+                    "{} of {} inference predictions done".format(iteration_num, nb_tot_predictions))
+
+            # TODO: save the outputs somewhere on disk
+            pass
+
+            # TODO: decide if you want to predict more or break
+            break
+
+
+
+
+class AffinityInferenceMixin(ParsingMixin):
+    def __init__(self, *super_args, **super_kwargs):
+        super(AffinityInferenceMixin, self).__init__(*super_args, **super_kwargs)
+        self._blending = None
+
+    def infer(self):
+        self.trainer.eval_mode()
+
+        # Update loader depending on the output shape:
+        self.deduce_crops_and_strides_from_output_size()
+
+        # Everytime we should loop over the full dataset (restart generators):
+        loader_iter = self.infer_loader.__iter__()
+        full_volume_shape = self.get("full_volume_infer_shape")
+        assert isinstance(full_volume_shape, tuple)
+        # TODO: (add augmentation)
+
+        # Output files
+        full_output = None
+        mask = None
+
+        # Record the epoch we're validating in
+        iteration_num = 0
+        nb_tot_predictions = len(loader_iter)
+        while True:
+            try:
+                inputs, indices = next(loader_iter)
+            except StopIteration:
+                self.trainer.console.info("Generator exhausted, breaking.")
+                break
+
+            assert all([isinstance(indx, IndexSpec) for indx in indices]), "During inference, the dataloader" \
+                                                                           "should return the indices"
+            self.trainer.console.progress("{} of {} inference predictions done".format(iteration_num, nb_tot_predictions))
+
+            pred, patch_mask = self.get_prediction(inputs)
+
+            for b in range(pred.shape[0]):
+                # TODO: not needed, gather does not anyway return anything else but a list of tensors
+                if not isinstance(pred, np.ndarray):
+                    pred_batch = pred[b].data.cpu().numpy()
+                else:
+                    pred_batch = pred[b]
+                patch_mask_batch = None if patch_mask is None else patch_mask[b].data.cpu().numpy()
+
+                full_output, mask = self.blend_new_patch(full_output, mask,
+                                                        pred_batch,
+                                                        indices[b].base_sequence_at_index,
+                                                         patch_mask=patch_mask_batch)
+
+            iteration_num += 1
+
+
+
+        # Crop full output:
+        if self.get("inference/global_padding", False):
+            # FIXME: assert and place all this stuff in a better place...!!
+            ds_ratio = self.get("inference/global_ds_ratio")
+            global_padding = self.get("inference/global_padding")
+            out_dws_fct = self.get("inference/output_dws_fact", [1, 1, 1])
+            global_padding = [[int(pad[0]/dws),int(pad[1]/dws)] for pad, dws in zip(global_padding, out_dws_fct)]
+            full_shape = self.get("full_volume_infer_shape")
+
+            crop = (slice(None),) +  tuple(slice(pad[0],
+                               full_shape[i] - pad[1],
+                               ds_ratio[i]) for i, pad in enumerate(
+                global_padding))
+            full_output = full_output[crop]
+            mask = mask[crop]
+
+        # divide by the mask to normalize all pixels
+        assert mask.shape == full_output.shape
+        if not (mask != 0).all():
+            print("Warning! Not all parts of the dataset have been predicted!")
+            # assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
+            #                       "(Is the stride set correctly..?)"
+            full_output[mask == 0] = -1.
+            mask[mask == 0] = 1.
+
+        full_output /= mask
+
+        self.save_infer_output(full_output)
+
+
+    def deduce_crops_and_strides_from_output_size(self):
+        # Get the first batch and compare input/output sizes:
+        inputs, _ = self.infer_loader.dataset[0]
+
+        # Get original input shape:
+        vol_config = self.get("loaders/infer/volume_config", ensure_exists=True)
+
+        def recursive_key_search(dict, out_key):
+            if out_key in dict:
+                return dict[out_key]
+            else:
+                for key in dict:
+                    out = recursive_key_search(dict[key], out_key)
+                    if out is not None:
+                        return out
+                return None
+        in_shape = recursive_key_search(vol_config, "window_size")
+        assert in_shape is not None, "Input window_size not found in config"
+
+        # FIXME: this crap
+        if isinstance(inputs, tuple):
+            inputs = tuple(inp.unsqueeze(0) for inp in inputs)
+        elif isinstance(inputs, list):
+            inputs = list(inp.unsqueeze(0) for inp in inputs)
+        else:
+            inputs = inputs.unsqueeze(0)
+        outputs, _ = self.get_prediction(inputs)
+
+        # Process outputs:
+        # if isinstance(inputs, (tuple, list)):
+        #     print("WARNING: considering the first input!")
+        #     inputs = inputs[0]
+        if isinstance(outputs, (tuple, list)):
+            print("WARNING: considering the first output!")
+            outputs = outputs[0]
+        # in_shape = inputs.shape[-3:]
+        out_shape = outputs.shape[-3:]
+
+        # Get local crop config (can be asymmetric!)
+        local_crop = self.get("inference/crop_prediction")
+        if hasattr(self.model, "final_asym_crop_pred"):
+            model_local_crop = self.model.final_asym_crop_pred
+            if local_crop is None:
+                local_crop = model_local_crop
+            else:
+                # Combine two crops:
+                local_crop = [[crp[0]+mdl_crp[0], crp[1]+mdl_crp[1]] for crp, mdl_crp in zip(local_crop, model_local_crop)]
+
+
+        if local_crop is not None:
+            # slicing w.r.t the current output
+            assert isinstance(local_crop, (tuple, list))
+            assert len(local_crop) == 3 and all([len(cr) == 2 for cr in local_crop])
+            local_slicing = tuple(slice(pad[0],
+                                        out_shape[i] - pad[1])
+                                  for i, pad in enumerate(local_crop))
+            self.set("inference/crop_prediction", local_crop)
+            out_shape_cropped = outputs[(slice(None), slice(None)) + local_slicing].shape[-3:]
+        else:
+            out_shape_cropped = outputs.shape[-3:]
+            local_crop = [[0,0], [0,0], [0,0]]
+
+        out_dws_fct = self.get("inference/output_dws_fact", [1,1,1])
+        out_shape_scaled = tuple(int(sh*dws) for sh, dws in zip(out_shape_cropped, out_dws_fct))
+
+        # Update the stride:
+        window_overlap = self.get("inference/window_overlap", [0, 0, 0])
+        assert len(window_overlap) == 3
+        stride = [shp-ovrlap*2 for shp, ovrlap in zip(list(out_shape_scaled), window_overlap)]
+        assert all(strd>0 for strd in stride), "Too much overlap for the current output shape of the model: " \
+                                               "{}, {}".format(window_overlap, out_shape_scaled)
+        self.set("loaders/infer/volume_config/stride", stride)
+        print("Shape of final prediction: {}. In the original res: {}".format(out_shape_cropped, out_shape_scaled))
+        print("Stride: {}.".format(stride))
+
+        # Deduce global crop, that should be in the output resolution:
+        input_shape_in_out_res = tuple(int(sh/dws_out) for sh, dws_out in zip(in_shape, out_dws_fct))
+        global_crop = deepcopy(local_crop)
+        diff = [in_sh-out_sh-pad[0]-pad[1] for in_sh, out_sh, pad in zip(input_shape_in_out_res, out_shape_cropped, global_crop)]
+        assert all(d % 2 == 0 for d in diff), "Something unexpected happened while cropping"
+        global_crop = [[int(d/2)+pad[0], int(d/2)+pad[1]] for d, pad in zip(diff, global_crop)]
+
+        # Save deduced crop for later:
+        self.set("inference/crop_global_slice", global_crop)
+        
+        # Re-build the inference-loader after setting the new stride:
+        self._infer_loader = self.build_infer_loader()
+
+
+
+    def get_prediction(self, inputs):
+        # Delay SIGINTs till after computation
+        with pyu.delayed_keyboard_interrupt(), torch.no_grad():
+            # Wrap
+            inputs = self.trainer.to_device(inputs)
+            if isinstance(inputs, (tuple, list)):
+                patch_outputs = self.trainer.apply_model(*inputs)
+            else:
+                patch_outputs = self.trainer.apply_model(inputs)
+
+        # FIXME: improve this
+        if self.get("inference/return_patch_mask"):
+            assert isinstance(patch_outputs, tuple)
+            assert len(patch_outputs) == 2
+            pred, mask = patch_outputs
+        else:
+            mask = None
+            if isinstance(patch_outputs, list):
+                output_idx = self.get("inference/index_output", 0)
+                pred = patch_outputs[output_idx]
+            else:
+                pred = patch_outputs
+        pred = self.postprocess_patch_outputs(pred)
+
+        return pred, mask
+
+    def save_infer_output(self, output):
+        pass
+
+    def postprocess_patch_outputs(self, patch_outputs):
+        return patch_outputs
+
+    def blend_new_patch(self, full_output, mask, patch_output, slicing, patch_mask=None):
+        assert isinstance(patch_output, np.ndarray)
+        assert patch_output.ndim == 4
+
+        nb_channels = patch_output.shape[0]
+        patch_shape = patch_output.shape[1:]
+        if full_output is None:
+            full_output = np.zeros((nb_channels,) + self.get("full_volume_infer_shape"), dtype='float32')
+        if mask is None:
+            mask = np.zeros((nb_channels,) + self.get("full_volume_infer_shape"), dtype='float32')
+
+        local_slicing, global_slicing = self.get_slicings(slicing, patch_shape)
+
+        # Apply local slicing in any case:
+        patch_output = patch_output[local_slicing]
+
+        if patch_mask is not None:
+            assert self.blending is None, "Outputed masks and blending are not supported at the same time"
+            mask[global_slicing] += patch_mask[local_slicing]
+            patch_output *= patch_mask[local_slicing]
+        else:
+            if self.blending is not None:
+                patch_output, blending_mask = self.blending(patch_output)
+                mask[global_slicing] += blending_mask
+            else:
+                mask[global_slicing] += 1
+        # add up predictions in the output
+        full_output[global_slicing] += patch_output
+
+        return full_output, mask
+
+    @property
+    def blending(self):
+        if self._blending is not None:
+            return self._blending
+        else:
+            if self.get("inference/blending_kwargs", None) is not None:
+                # TODO: fix reference...
+                from neurofire.inference.blending import Blending
+                blending_kwargs = self.get("inference/blending_kwargs")
+                if "ramp_size" not in blending_kwargs:
+                    window_overlap = self.get("inference/window_overlap", None)
+                    assert window_overlap is not None, "No ramp size could be deduced for blending"
+                    blending_kwargs['ramp_size'] = window_overlap
+                self._blending = Blending(**blending_kwargs)
+                return self._blending
+                # TODO: init _blending
+            else:
+                return None
+
+    def get_slicings(self, slicing, shape):
+        slice_crop = self.get("inference/crop_global_slice", False)
+        prediction_crop = self.get("inference/crop_prediction", False)
+        if len(slicing) == 4:
+            slicing = slicing[1:]
+        assert all([slicing[i].step == 1 for i in range(3)]), "Downscaling option not implemented yet!"
+
+        # Check whether the output has a different resolution, then rescale global slicing:
+        out_dws_fct = self.get("inference/output_dws_fact", [1,1,1])
+        # print(slicing)
+        # assert all(all((slc.start % dws == 0, slc.stop % dws == 0)) for slc, dws in zip(slicing, out_dws_fct))
+        global_slicing = tuple(slice(int(slc.start / dws), int(slc.stop / dws) ) for slc, dws in zip(slicing, out_dws_fct))
+
+        # crop away the padding (we treat global as local padding) if specified
+        # this is generally not necessary if we use blending
+        if slice_crop:
+            # slicing w.r.t the global output
+            assert isinstance(slice_crop, (tuple, list))
+            assert len(slice_crop) == 3 and all([len(cr) == 2 for cr in slice_crop])
+            global_slicing = tuple(slice(global_slicing[i].start + pad[0],
+                                         global_slicing[i].stop - pad[1])
+                                   for i, pad in enumerate(slice_crop))
+        if prediction_crop:
+            # slicing w.r.t the current output
+            assert isinstance(prediction_crop, (tuple, list))
+            assert len(prediction_crop) == 3 and all([len(cr) == 2 for cr in prediction_crop])
+            local_slicing = tuple(slice(pad[0],
+                                        shape[i] - pad[1])
+                                  for i, pad in enumerate(prediction_crop))
+        else:
+            local_slicing = tuple(slice(None, None) for _ in range(3))
+
+        # Add channel dimension:
+        local_slicing = (slice(None), ) + local_slicing
+        global_slicing = (slice(None), ) + global_slicing
+
+        return local_slicing, global_slicing
+
+    @property
+    def trainer(self):
+        """
+        inferno trainer. Will be loaded from file on first use.
+        """
+        if inferno is None:
+            raise ModuleNotFoundError("InfernoMixin requires inferno. You can "
+                                      "install it with `pip install in "
+                                      "pip install inferno-pytorch`")
+        # Build trainer if it doesn't exist
+        if not hasattr(self, '_trainer'):
+
+            # noinspection PyAttributeOutsideInit
+            self._trainer = inferno.trainers.basic.Trainer(self.model)
+            # self._trainer = inferno.trainers.basic.Trainer() \
+            #     .load(self.get("inference/path_checkpoint_trainer"), best=True)
+
+            self._trainer.to(self.device)
+
+        return self._trainer
+
+    def build_loader(self):
+        trainer = self.trainer
+        trainer.bind_loader('test',
+                                  self.infer_loader)
+
+        if self.val_loader is not None:
+            self._trainer.bind_loader('validate',
+                                      self.val_loader,
+                                      num_targets=self.num_targets)
+
+
+    @property
+    def device(self):
+        # TODO: move to ParsingMixin?
+        if self._device is None:
+            # noinspection PyAttributeOutsideInit
+            self._device = torch.device(self.get('device'))
+        return self._device
+
+    @property
+    def infer_loader(self):
+        if not hasattr(self, '_infer_loader'):
+            self._infer_loader = self.build_infer_loader()
+            out_dws_fact = self.get("inference/output_dws_fact", [1,1,1])
+            if hasattr(self._infer_loader.dataset, "volume"):
+                dataset = self._infer_loader.dataset
+            elif hasattr(self._infer_loader.dataset, "datasets"):
+                dataset = self._infer_loader.dataset.datasets[0]
+            else:
+                raise ValueError("Dataset not found in infer_loader")
+            full_shape = dataset.volume.shape
+            if dataset.is_multichannel:
+                full_shape = full_shape[1:]
+            assert len(full_shape) == 3
+            self.set("full_volume_infer_shape", tuple(int(sh/scl) for sh, scl in zip(full_shape, out_dws_fact)))
+            self.set("inference/global_padding", dataset.padding)
+            self.set("inference/global_ds_ratio", dataset.downsampling_ratio)
+
+        return self._infer_loader
